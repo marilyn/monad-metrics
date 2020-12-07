@@ -42,6 +42,7 @@ module Control.Monad.Metrics
     , timed
     , timed'
     , timedList
+    , timedListWith
     , label
     , label'
     , Resolution(..)
@@ -243,13 +244,22 @@ timed' resolution name action = timedList resolution [name] action
 -- duration distribution for requests of type @"sometype"@ from any user.
 --
 timedList :: (MonadIO m, MonadMetrics m, MonadMask m) => Resolution -> [Text] -> m a -> m a
-timedList resolution names action = 
+timedList = timedListWith distribution
+
+timedListWith
+  :: (MonadIO m, MonadMetrics m, MonadMask m)
+  => (Text -> Double -> m ())
+  -> Resolution
+  -> [Text]
+  -> m a
+  -> m a
+timedListWith adder resolution names action =
     bracket (liftIO (getTime Monotonic)) finish (const action)
   where
     finish start = do
         end <- liftIO (getTime Monotonic)
         forM_ names $ \name ->
-            distribution name (diffTime resolution end start)
+            adder name (diffTime resolution end start)
 
 -- | Record the time of executing the given action in seconds. Defers to
 -- 'timed''.
