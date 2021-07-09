@@ -1,7 +1,8 @@
-{-# LANGUAGE FlexibleContexts     #-}
-{-# LANGUAGE FlexibleInstances    #-}
-{-# LANGUAGE RecordWildCards      #-}
-{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE FlexibleContexts      #-}
+{-# LANGUAGE FlexibleInstances     #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE RecordWildCards       #-}
+{-# LANGUAGE TypeFamilies          #-}
 
 {-|
 Module      : Control.Monad.Metrics
@@ -48,18 +49,19 @@ module Control.Monad.Metrics
     -- * The Metrics Type
     -- $metrictype
     , Metrics
+    , KeyedMetrics
     , metricsCounters
     , metricsGauges
     , metricsLabels
     , metricsStore
+    , MetricKey(..)
+    , Meterable(..)
     ) where
 
-import           Control.Monad                  (liftM, forM_)
+import           Control.Monad                  (forM_, liftM)
 import           Control.Monad.Catch            (MonadMask, bracket)
 import           Control.Monad.IO.Class         (MonadIO (..))
-import           Control.Monad.Reader           (MonadReader (..), ReaderT (..))
-import           Control.Monad.Trans            (MonadTrans (..))
-import           Data.Hashable                  (Hashable)
+import           Control.Monad.Reader           (ReaderT (..))
 import           Data.HashMap.Strict            (HashMap)
 import qualified Data.HashMap.Strict            as HashMap
 import           Data.IORef                     (IORef, atomicModifyIORef',
@@ -78,20 +80,6 @@ import           System.Metrics.Label           as Label
 import           Prelude
 
 import           Control.Monad.Metrics.Internal
-
--- | A type can be an instance of 'MonadMetrics' if it can provide a 'Metrics'
--- somehow. Commonly, this will be implemented as a 'ReaderT' where some
--- field in the environment is the 'Metrics' data.
---
--- * /Since v0.1.0.0/
-class Monad m => MonadMetrics m where
-    getMetrics :: m Metrics
-
-instance {-# OVERLAPPABLE #-} (MonadMetrics m, MonadTrans t, Monad (t m)) => MonadMetrics (t m) where
-    getMetrics = lift getMetrics
-
-instance Monad m => MonadMetrics (ReaderT Metrics m) where
-    getMetrics = ask
 
 -- $initializing
 -- This library tends to provide simple functions with plain names and
@@ -113,7 +101,7 @@ instance Monad m => MonadMetrics (ReaderT Metrics m) where
 -- 'MonadMetrics' instance.
 --
 -- */Since v0.1.0.0/
-run :: MonadIO m => ReaderT Metrics m a -> m a
+run :: (Meterable m, MonadIO m, MetricKey ck, MetricKey gk, MetricKey dk, MetricKey lk) => ReaderT (KeyedMetrics ck gk dk lk) m a -> m a
 run = run' id
 
 -- | Adds metric recording capabilities to the given action. The first
@@ -131,7 +119,7 @@ run = run' id
 -- @
 --
 -- */Since v0.1.0.0/
-run' :: MonadIO m => (Metrics -> r) -> ReaderT r m a -> m a
+run' :: (Meterable m, MonadIO m, MetricKey ck, MetricKey gk, MetricKey dk, MetricKey lk) => (KeyedMetrics ck gk dk lk -> r) -> ReaderT r m a -> m a
 run' k action = do
     m <- liftIO initialize
     runReaderT action (k m)
@@ -139,19 +127,19 @@ run' k action = do
 -- | Initializes a 'Metrics' value with the given 'System.Metrics.Store'.
 --
 -- */Since v0.1.0.0/
-initializeWith :: EKG.Store -> IO Metrics
+initializeWith :: (MetricKey ck, MetricKey gk, MetricKey dk, MetricKey lk) => EKG.Store -> IO (KeyedMetrics ck gk dk lk)
 initializeWith _metricsStore = do
     _metricsCounters <- newIORef mempty
     _metricsDistributions <- newIORef mempty
     _metricsGauges <- newIORef mempty
     _metricsLabels <- newIORef mempty
-    return Metrics{..}
+    return KeyedMetrics{..}
 
 -- | Initializes a 'Metrics' value, creating a new 'System.Metrics.Store'
 -- for it.
 --
 -- * /Since v0.1.0.0/
-initialize :: IO Metrics
+initialize :: (MetricKey ck, MetricKey gk, MetricKey dk, MetricKey lk) => IO (KeyedMetrics ck gk dk lk)
 initialize = EKG.newStore >>= initializeWith
 
 -- $collecting
@@ -168,13 +156,13 @@ initialize = EKG.newStore >>= initializeWith
 -- | Increment the named counter by 1.
 --
 -- * /Since v0.1.0.0/
-increment :: (MonadIO m, MonadMetrics m) => Text -> m ()
+increment :: (MonadIO m, MonadMetrics m, CounterKeyFor m counterKey) => counterKey -> m ()
 increment name = counter name 1
 
 -- | Adds the value to the named 'System.Metrics.Counter.Counter'.
 --
 -- * /Since v0.1.0.0/
-counter' :: (MonadIO m, MonadMetrics m, Integral int) => Text -> int -> m ()
+counter' :: (MonadIO m, MonadMetrics m, CounterKeyFor m counterKey, Integral int) => counterKey -> int -> m ()
 counter' =
     modifyMetric Counter.add fromIntegral EKG.createCounter _metricsCounters
 
@@ -182,27 +170,27 @@ counter' =
 -- errors.
 --
 -- * /Since v0.1.0.0/
-counter :: (MonadIO m, MonadMetrics m) => Text -> Int -> m ()
+counter :: (MonadIO m, MonadMetrics m, CounterKeyFor m counterKey) => counterKey -> Int -> m ()
 counter = counter'
 
 -- | Add the value to the named 'System.Metrics.Distribution.Distribution'.
 --
 -- * /Since v0.1.0.0/
-distribution :: (MonadIO m, MonadMetrics m) => Text -> Double -> m ()
+distribution :: (MonadIO m, MonadMetrics m, DistributionKeyFor m distributionKey) => distributionKey -> Double -> m ()
 distribution =
     modifyMetric Distribution.add id EKG.createDistribution _metricsDistributions
 
 -- | Set the value of the named 'System.Metrics.Distribution.Gauge'.
 --
 -- * /Since v0.1.0.0/
-gauge' :: (MonadIO m, MonadMetrics m, Integral int) => Text -> int -> m ()
+gauge' :: (MonadIO m, MonadMetrics m, GaugeKeyFor m gaugeKey, Integral int) => gaugeKey -> int -> m ()
 gauge' =
     modifyMetric Gauge.set fromIntegral EKG.createGauge _metricsGauges
 
 -- | A type specialized version of 'gauge'' to avoid ambiguous types.
 --
 -- * /Since v0.1.0.0/
-gauge :: (MonadIO m, MonadMetrics m) => Text -> Int -> m ()
+gauge :: (MonadIO m, MonadMetrics m, GaugeKeyFor m gaugeKey) => gaugeKey -> Int -> m ()
 gauge = gauge'
 
 -- | See 'System.Metrics.Distribution.Gauge.dec'.
@@ -224,7 +212,7 @@ gaugeIncrement name =
 -- to the specified 'Resolution'.
 --
 -- * /Since v0.1.0.0/
-timed' :: (MonadIO m, MonadMetrics m, MonadMask m) => Resolution -> Text -> m a -> m a
+timed' :: (MonadIO m, MonadMetrics m, MonadMask m, DistributionKeyFor m distributionKey) => Resolution -> distributionKey -> m a -> m a
 timed' resolution name action = timedList resolution [name] action
 
 -- | Record the time taken to perform the action, under several names at once.
@@ -242,8 +230,8 @@ timed' resolution name action = timedList resolution [name] action
 -- of user @"someuser"@ of any type; and @"request.byType.sometype"@ storing
 -- duration distribution for requests of type @"sometype"@ from any user.
 --
-timedList :: (MonadIO m, MonadMetrics m, MonadMask m) => Resolution -> [Text] -> m a -> m a
-timedList resolution names action = 
+timedList :: (MonadIO m, MonadMetrics m, MonadMask m, DistributionKeyFor m distributionKey) => Resolution -> [distributionKey] -> m a -> m a
+timedList resolution names action =
     bracket (liftIO (getTime Monotonic)) finish (const action)
   where
     finish start = do
@@ -255,19 +243,19 @@ timedList resolution names action =
 -- 'timed''.
 --
 -- * /Since v0.1.0.0/
-timed :: (MonadIO m, MonadMetrics m, MonadMask m) => Text -> m a -> m a
+timed :: (MonadIO m, MonadMetrics m, MonadMask m, DistributionKeyFor m distributionKey) => distributionKey -> m a -> m a
 timed = timed' Seconds
 
 -- | Set the 'Label' to the given 'Text' value.
 --
 -- * /Since v0.1.0.0/
-label :: (MonadIO m, MonadMetrics m) => Text -> Text -> m ()
+label :: (MonadIO m, MonadMetrics m, LabelKeyFor m labelKey) => labelKey -> Text -> m ()
 label = modifyMetric Label.set id EKG.createLabel _metricsLabels
 
 -- | Set the 'Label' to the 'Show'n value of whatever you pass in.
 --
 -- * /Since v0.1.0.0/
-label' :: (MonadIO m, MonadMetrics m, Show a) => Text -> a -> m ()
+label' :: (MonadIO m, MonadMetrics m, LabelKeyFor m labelKey, Show a) => labelKey -> a -> m ()
 label' l = label l . Text.pack . show
 
 -- $metrictype
@@ -279,12 +267,12 @@ label' l = label l . Text.pack . show
 -------------------------------------------------------------------------------
 
 modifyMetric
-    :: (MonadMetrics m, MonadIO m)
+    :: (MonadMetrics m, MonadIO m, MetricKey key)
     => (t -> t1 -> IO b) -- ^ The action to add a value to a metric.
     -> (t2 -> t1) -- ^ A conversion function from input to metric value.
     -> (Text -> EKG.Store -> IO t) -- ^ The function for creating a new metric.
-    -> (Metrics -> IORef (HashMap Text t)) -- ^ A way of getting the current metrics.
-    -> Text -- ^ The name of the metric to use.
+    -> (KeyedMetrics (CounterKey m) (GaugeKey m) (DistributionKey m) (LabelKey m) -> IORef (HashMap key t)) -- ^ A way of getting the current metrics.
+    -> key -- ^ The name of the metric to use.
     -> t2 -- ^ The value the end user can provide.
     -> m b
 modifyMetric adder converter creator getter name value = do
@@ -292,15 +280,15 @@ modifyMetric adder converter creator getter name value = do
     liftIO $ adder bar (converter value)
 
 lookupOrCreate
-    :: (MonadMetrics m, MonadIO m, Eq k, Hashable k)
-    => (Metrics -> IORef (HashMap k a)) -> (k -> EKG.Store -> IO a) -> k -> m a
+    :: (MonadMetrics m, MonadIO m, MetricKey k)
+    => (KeyedMetrics (CounterKey m) (GaugeKey m) (DistributionKey m) (LabelKey m) -> IORef (HashMap k a)) -> (Text -> EKG.Store -> IO a) -> k -> m a
 lookupOrCreate getter creator name = do
     ref <- liftM getter getMetrics
     -- unsafeInterleaveIO is used here to defer creating the metric into
     -- the 'atomicModifyIORef'' function. We lazily create the value here,
     -- and the resulting IO action only gets run to create the metric when
     -- the named metric is not present in the map.
-    newMetric <- liftIO . unsafeInterleaveIO . creator name =<< liftM _metricsStore getMetrics
+    newMetric <- liftIO . unsafeInterleaveIO . creator (toText name) =<< liftM _metricsStore getMetrics
     liftIO $ atomicModifyIORef' ref (\container ->
         case HashMap.lookup name container of
             Nothing ->

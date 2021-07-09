@@ -19,6 +19,7 @@ We'll need to start with the import/pragma boilerplate:
 
 ```haskell
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE FlexibleContexts  #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
 
